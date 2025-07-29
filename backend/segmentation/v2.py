@@ -272,67 +272,200 @@ def segment_word(sentence_roi):
         prev_x_end = x + w
     return words
 
-def compute_iou(bbox1, bbox2):
-    """Calculate Intersection over Union (IoU) for two bounding boxes."""
-    x1, y1, w1, h1 = bbox1
-    x2, y2, w2, h2 = bbox2
-    xi1 = max(x1, x2)
-    yi1 = max(y1, y2)
-    xi2 = min(x1 + w1, x2 + w2)
-    yi2 = min(y1 + h1, y2 + h2)
-    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-    bbox1_area = w1 * h1
-    bbox2_area = w2 * h2
-    union_area = bbox1_area + bbox2_area - inter_area
-    return inter_area / union_area if union_area > 0 else 0
-
 def segment_character(word_roi):
-    """Segment word into characters and ottaksharas with improved spatial relationship analysis."""
+    """
+    Enhanced character segmentation with preserved original order.
+    """
     row, col = word_roi.shape
     processing_roi = word_roi
+    
+    # Edge detection and thresholding
     edges = cv2.Canny(processing_roi, 50, 150)
     ret, thresh_inv = cv2.threshold(processing_roi, 127, 255, cv2.THRESH_BINARY_INV)
     combined = cv2.bitwise_or(edges, thresh_inv)
+    
+    # Connected component analysis
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined, connectivity=8)
     sorted_indices = sort_components(stats, "left-to-right")
-    characters = []
-    ottaksharas = []
-    avg_char_height = np.mean([stats[idx, cv2.CC_STAT_HEIGHT] for idx in sorted_indices if stats[idx, cv2.CC_STAT_AREA] > 100])
-    for idx in sorted_indices:
+    
+    # Calculate baseline statistics
+    valid_components = [idx for idx in sorted_indices if stats[idx, cv2.CC_STAT_AREA] > 100]
+    
+    if not valid_components:
+        return []
+    
+    # Calculate more robust statistics
+    heights = [stats[idx, cv2.CC_STAT_HEIGHT] for idx in valid_components]
+    areas = [stats[idx, cv2.CC_STAT_AREA] for idx in valid_components]
+    y_positions = [stats[idx, cv2.CC_STAT_TOP] for idx in valid_components]
+    
+    avg_height = np.mean(heights)
+    median_area = np.median(areas)
+    
+    # Estimate baseline (where most main characters sit)
+    baseline_y = np.percentile(y_positions, 25)
+    
+    # STEP 1: Create ordered list of all components with their original positions
+    all_components = []
+    for i, idx in enumerate(valid_components):
         x = stats[idx, cv2.CC_STAT_LEFT]
         y = stats[idx, cv2.CC_STAT_TOP]
         w = stats[idx, cv2.CC_STAT_WIDTH]
         h = stats[idx, cv2.CC_STAT_HEIGHT]
         area = stats[idx, cv2.CC_STAT_AREA]
-        if area < 100:
-            continue
+        
         roi = word_roi[y:y+h, x:x+w]
         bbox = (x, y, w, h)
-        if (y > row * 0.7) or (h < avg_char_height * 0.6 and area < np.median([stats[i, cv2.CC_STAT_AREA] for i in sorted_indices if stats[i, cv2.CC_STAT_AREA] > 100])):
-            ottaksharas.append((roi, bbox))
-        else:
-            characters.append((roi, bbox, []))
-    for ott_roi, ott_bbox in ottaksharas:
-        ott_x, ott_y, ott_w, ott_h = ott_bbox
-        ott_center = ott_x + ott_w / 2
-        min_distance = float('inf')
-        associated_char_idx = -1
-        max_iou = 0
-        for i, (_, char_bbox, _) in enumerate(characters):
-            char_x, char_y, char_w, char_h = char_bbox
-            char_center = char_x + char_w / 2
-            is_below = ott_y > char_y + char_h * 0.5
-            is_diagonal_right = ott_x >= char_x - ott_w * 0.5 and ott_x + ott_w <= char_x + char_w * 1.5
-            iou = compute_iou(ott_bbox, char_bbox)
-            distance = abs(ott_center - char_center) + abs(ott_y - (char_y + char_h)) * 0.5
-            if (is_below or is_diagonal_right) and (iou > 0.1 or distance < min_distance):
-                if iou > max_iou or (iou == max_iou and distance < min_distance):
-                    max_iou = iou
-                    min_distance = distance
-                    associated_char_idx = i
-        if associated_char_idx >= 0:
-            characters[associated_char_idx][2].append((ott_roi, ott_bbox))
-    return characters
+        
+        # Calculate ottakshara probability
+        ottakshara_score = 0
+        
+        # Size-based criteria
+        if area < median_area * 0.7:
+            ottakshara_score += 2
+        if h < avg_height * 0.75:
+            ottakshara_score += 2
+        if area < median_area * 0.4:
+            ottakshara_score += 3
+            
+        # Position-based criteria
+        if y > baseline_y + avg_height * 0.3:
+            ottakshara_score += 3
+        if y > row * 0.6:
+            ottakshara_score += 2
+            
+        # Aspect ratio criteria
+        aspect_ratio = w / h if h > 0 else 0
+        if aspect_ratio > 1.5:
+            ottakshara_score += 1
+        
+        # Store component with its original order index
+        all_components.append({
+            'roi': roi,
+            'bbox': bbox,
+            'ottakshara_score': ottakshara_score,
+            'original_index': i,  # Preserve original left-to-right order
+            'is_ottakshara': ottakshara_score >= 5,  # Slightly higher threshold
+            'associated_with': None  # Will be set if it's an ottakshara
+        })
+    
+    # STEP 2: Identify ottaksharas and associate them WITHOUT changing order
+    for i, component in enumerate(all_components):
+        if component['is_ottakshara']:
+            ott_bbox = component['bbox']
+            ott_x, ott_y, ott_w, ott_h = ott_bbox
+            ott_center_x = ott_x + ott_w / 2
+            
+            best_association = None
+            best_score = -1
+            
+            # Look for association candidates (only main characters)
+            for j, candidate in enumerate(all_components):
+                if not candidate['is_ottakshara'] and j != i:
+                    char_bbox = candidate['bbox']
+                    char_x, char_y, char_w, char_h = char_bbox
+                    char_center_x = char_x + char_w / 2
+                    char_bottom = char_y + char_h
+                    
+                    association_score = 0
+                    
+                    # 1. Horizontal alignment
+                    horizontal_overlap = min(ott_x + ott_w, char_x + char_w) - max(ott_x, char_x)
+                    if horizontal_overlap > 0:
+                        overlap_ratio = horizontal_overlap / min(ott_w, char_w)
+                        association_score += overlap_ratio * 3
+                    
+                    # 2. Vertical relationship
+                    vertical_distance = ott_y - char_bottom
+                    if vertical_distance >= -char_h * 0.2:
+                        if vertical_distance <= char_h * 0.5:
+                            association_score += 3
+                        elif vertical_distance <= char_h:
+                            association_score += 1
+                    
+                    # 3. Horizontal proximity
+                    horizontal_distance = abs(ott_center_x - char_center_x)
+                    if horizontal_distance <= char_w * 0.8:
+                        association_score += (char_w * 0.8 - horizontal_distance) / (char_w * 0.8) * 2
+                    
+                    # 4. Size relationship
+                    size_ratio = (ott_w * ott_h) / (char_w * char_h)
+                    if 0.1 <= size_ratio <= 0.8:
+                        association_score += 2
+                    elif size_ratio <= 1.0:
+                        association_score += 1
+                    
+                    # 5. IoU-based association
+                    iou = compute_iou(ott_bbox, char_bbox)
+                    if iou > 0:
+                        association_score += iou * 2
+                    
+                    # Update best association
+                    if association_score > best_score and association_score > 3:
+                        best_score = association_score
+                        best_association = j
+            
+            # Associate ottakshara with best matching main character
+            if best_association is not None:
+                component['associated_with'] = best_association
+            else:
+                # If no good association, treat as main character
+                component['is_ottakshara'] = False
+    
+    # STEP 3: Build final result maintaining original order
+    final_characters = []
+    
+    # First, create main characters in original order
+    for component in all_components:
+        if not component['is_ottakshara']:
+            char_data = [component['roi'], component['bbox'], []]
+            final_characters.append({
+                'data': char_data,
+                'original_index': component['original_index']
+            })
+    
+    # Then, associate ottaksharas with their main characters
+    for component in all_components:
+        if component['is_ottakshara'] and component['associated_with'] is not None:
+            # Find the main character this ottakshara belongs to
+            target_original_index = all_components[component['associated_with']]['original_index']
+            
+            # Find the corresponding final character
+            for final_char in final_characters:
+                if final_char['original_index'] == target_original_index:
+                    final_char['data'][2].append((component['roi'], component['bbox']))
+                    break
+    
+    # STEP 4: Sort final characters by original index to maintain order
+    final_characters.sort(key=lambda x: x['original_index'])
+    
+    # Extract just the character data in the correct order
+    return [char['data'] for char in final_characters]
+
+def compute_iou(bbox1, bbox2):
+    """Enhanced IoU calculation with weighted overlap for ottakshara detection."""
+    x1, y1, w1, h1 = bbox1
+    x2, y2, w2, h2 = bbox2
+    
+    # Standard IoU calculation
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+    
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    bbox1_area = w1 * h1
+    bbox2_area = w2 * h2
+    union_area = bbox1_area + bbox2_area - inter_area
+    
+    iou = inter_area / union_area if union_area > 0 else 0
+    
+    # Additional proximity score for adjacent components
+    center_distance = np.sqrt((x1 + w1/2 - x2 - w2/2)**2 + (y1 + h1/2 - y2 - h2/2)**2)
+    max_dimension = max(w1, h1, w2, h2)
+    proximity_score = max(0, 1 - center_distance / (max_dimension * 2))
+    
+    return iou + proximity_score * 0.3
 
 def compute_metrics(segmentation_result):
     """Compute and print segmentation metrics."""

@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import traceback
-from segmentation.main import process_image, Binarization
+from segmentation.main_1 import process_image, Binarization
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
@@ -397,7 +397,7 @@ def process_image_with_predictions(image_path, main_model, ott_model, main_mean,
     if mappings is None:
         print("Warning: Proceeding without character mappings. Ottaksharas will be ignored.")
     
-    # Call the segmentation pipeline from segmentation.main
+    # Call the segmentation pipeline from segmentation.main_1
     segmentation_result = process_image(image_path, os.path.join(output_dir, session_id))
     if segmentation_result is None:
         raise ValueError(f"Segmentation failed for image at {image_path}")
