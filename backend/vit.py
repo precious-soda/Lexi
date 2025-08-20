@@ -8,15 +8,9 @@ import torch.nn as nn
 import torchvision.transforms.v2 as T
 import pandas as pd
 import random
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
 import traceback
-from scipy.ndimage import interpolation
 import timm
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
+from segmentation.v2 import process_image, Binarization
 
 # Configuration classes
 class MainCFG:
@@ -25,10 +19,10 @@ class MainCFG:
     MODEL_NAME = 'kannada_vit'
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SEED = 42
-    OUTPUT_DIR = os.path.join('models','vit', 'main', 'output')
+    OUTPUT_DIR = os.path.join('models', 'vit', 'main', 'output')
     CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
     MODEL_CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, 'kannada_vit_best.pth')
-    LABEL_CSV_PATH = os.path.join( 'label-main.csv')
+    LABEL_CSV_PATH = os.path.join('label-main.csv')
     NORM_STATS_FILE = os.path.join(OUTPUT_DIR, 'norm_stats.pth')
 
 class OttaksharaCFG:
@@ -37,22 +31,15 @@ class OttaksharaCFG:
     MODEL_NAME = 'kannada_vit'
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SEED = 42
-    OUTPUT_DIR = os.path.join('models','vit', 'ottaksharas', 'output')
+    OUTPUT_DIR = os.path.join('models', 'vit', 'ottaksharas', 'output')
     CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
     MODEL_CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, 'kannada_vit_best.pth')
-    LABEL_CSV_PATH = os.path.join( 'label-ottaksharas.csv')
+    LABEL_CSV_PATH = os.path.join('label-ottaksharas.csv')
     NORM_STATS_FILE = os.path.join(OUTPUT_DIR, 'norm_stats.pth')
 
-UPLOAD_FOLDER = './uploads'
-STATIC_FOLDER = './static'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['STATIC_FOLDER'] = STATIC_FOLDER
+FONT_PATH = './model/NotoSansKannada-VariableFont_wdthwght.ttf'
 TARGET_SIZE = MainCFG.IMAGE_SIZE
 CROP_PADDING = 10
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(STATIC_FOLDER, exist_ok=True)
 
 # Seed for reproducibility
 def seed_everything(seed):
@@ -79,7 +66,6 @@ def load_model_and_stats(checkpoint_path, cfg):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
     model = build_model(cfg)
     try:
-        # Set weights_only=False to allow loading checkpoints with non-standard objects
         checkpoint = torch.load(checkpoint_path, map_location=cfg.DEVICE, weights_only=False)
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint: {e}")
@@ -188,173 +174,12 @@ def combine_characters(main_index, ottakshara_index, main_chars, ott_class_names
         conjunct += vowel_sign
     return conjunct
 
-def radon_transform_skew(image, angle_range=(-10, 10), angle_step=0.5):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    angles = np.arange(angle_range[0], angle_range[1], angle_step)
-    sinogram = np.zeros((binary.shape[0], len(angles)))
-    for i, angle in enumerate(angles):
-        rotated = interpolation.rotate(binary, angle, reshape=False, mode='nearest')
-        projection = np.sum(rotated, axis=1)
-        sinogram[:, i] = projection
-    variances = np.var(sinogram, axis=0)
-    best_angle = angles[np.argmax(variances)]
-    return best_angle
-
-def deskew_image(image):
-    skew_angle = radon_transform_skew(image)
-    (h, w) = image.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, skew_angle, 1.0)
-    deskewed = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    return deskewed
-
-def sort_components(stats, method="left-to-right"):
-    reverse = False
-    i = 0
-    if method in ["right-to-left", "bottom-to-top"]:
-        reverse = True
-    if method in ["top-to-bottom", "bottom-to-top"]:
-        i = 1
-    indices = np.argsort(stats[1:, i])[::-1 if reverse else 1] + 1
-    return indices
-
-def segment_sentence(image):
-    original_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(original_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    horizontal_projection = np.sum(binary, axis=1)
-    lines = []
-    in_line = False
-    start_y = 0
-    threshold = np.max(horizontal_projection) * 0.1
-    for i, projection in enumerate(horizontal_projection):
-        if projection > threshold and not in_line:
-            start_y = i
-            in_line = True
-        elif projection <= threshold and in_line:
-            end_y = i
-            if end_y - start_y > 10:
-                lines.append((start_y, end_y))
-            in_line = False
-    if in_line:
-        lines.append((start_y, len(horizontal_projection)))
-    sentences = []
-    for start_y, end_y in lines:
-        line_region = binary[start_y:end_y, :]
-        cols_with_content = np.sum(line_region, axis=0)
-        content_cols = np.where(cols_with_content > 0)[0]
-        if len(content_cols) > 0:
-            left_x = content_cols[0]
-            right_x = content_cols[-1]
-            padding = 5
-            left_x = max(0, left_x - padding)
-            right_x = min(original_gray.shape[1] - 1, right_x + padding)
-            start_y = max(0, start_y - padding)
-            end_y = min(original_gray.shape[0] - 1, end_y + padding)
-            roi = original_gray[start_y:end_y, left_x:right_x+1]
-            bbox = (left_x, start_y, right_x - left_x + 1, end_y - start_y)
-            sentences.append((roi, bbox))
-    return sentences
-
-def segment_word(sentence_roi):
-    blurred_sentence = cv2.medianBlur(sentence_roi, 3)
-    blurred_sentence = cv2.GaussianBlur(blurred_sentence, (5, 5), 0)
-    edges = cv2.Canny(blurred_sentence, 50, 150)
-    ret, thresh_inv = cv2.threshold(blurred_sentence, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    combined = cv2.bitwise_or(edges, thresh_inv)
-    line_height = sentence_roi.shape[0]
-    kernel_width = max(10, int(line_height * 0.5))
-    kernel = np.ones((5, kernel_width), np.uint8)
-    img_closing = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(img_closing, connectivity=8)
-    sorted_indices = sort_components(stats, "left-to-right")
-    areas = [stats[idx, cv2.CC_STAT_AREA] for idx in sorted_indices]
-    area_threshold = np.median(areas) * 0.1 if areas else 1000
-    words = []
-    prev_x_end = -float('inf')
-    gap_threshold = int(line_height * 0.3)
-    for idx in sorted_indices:
-        x = stats[idx, cv2.CC_STAT_LEFT]
-        y = stats[idx, cv2.CC_STAT_TOP]
-        w = stats[idx, cv2.CC_STAT_WIDTH]
-        h = stats[idx, cv2.CC_STAT_HEIGHT]
-        area = stats[idx, cv2.CC_STAT_AREA]
-        if area < area_threshold:
-            continue
-        gap = x - prev_x_end
-        if gap > gap_threshold and prev_x_end != -float('inf'):
-            pass
-        roi = sentence_roi[y:y+h, x:x+w]
-        words.append((roi, (x, y, w, h)))
-        prev_x_end = x + w
-    return words
-
-def compute_iou(bbox1, bbox2):
-    x1, y1, w1, h1 = bbox1
-    x2, y2, w2, h2 = bbox2
-    xi1 = max(x1, x2)
-    yi1 = max(y1, y2)
-    xi2 = min(x1 + w1, x2 + w2)
-    yi2 = min(y1 + h1, y2 + h2)
-    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-    bbox1_area = w1 * h1
-    bbox2_area = w2 * h2
-    union_area = bbox1_area + bbox2_area - inter_area
-    return inter_area / union_area if union_area > 0 else 0
-
-def segment_character(word_roi):
-    row, col = word_roi.shape
-    processing_roi = word_roi
-    edges = cv2.Canny(processing_roi, 50, 150)
-    ret, thresh_inv = cv2.threshold(processing_roi, 127, 255, cv2.THRESH_BINARY_INV)
-    combined = cv2.bitwise_or(edges, thresh_inv)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined, connectivity=8)
-    sorted_indices = sort_components(stats, "left-to-right")
-    characters = []
-    ottaksharas = []
-    avg_char_height = np.mean([stats[idx, cv2.CC_STAT_HEIGHT] for idx in sorted_indices if stats[idx, cv2.CC_STAT_AREA] > 100])
-    for idx in sorted_indices:
-        x = stats[idx, cv2.CC_STAT_LEFT]
-        y = stats[idx, cv2.CC_STAT_TOP]
-        w = stats[idx, cv2.CC_STAT_WIDTH]
-        h = stats[idx, cv2.CC_STAT_HEIGHT]
-        area = stats[idx, cv2.CC_STAT_AREA]
-        if area < 100:
-            continue
-        roi = word_roi[y:y+h, x:x+w]
-        bbox = (x, y, w, h)
-        if (y > row * 0.7) or (h < avg_char_height * 0.6 and area < np.median([stats[i, cv2.CC_STAT_AREA] for i in sorted_indices if stats[i, cv2.CC_STAT_AREA] > 100])):
-            ottaksharas.append((roi, bbox))
-        else:
-            characters.append((roi, bbox, []))
-    for ott_roi, ott_bbox in ottaksharas:
-        ott_x, ott_y, ott_w, ott_h = ott_bbox
-        ott_center = ott_x + ott_w / 2
-        min_distance = float('inf')
-        associated_char_idx = -1
-        max_iou = 0
-        for i, (_, char_bbox, _) in enumerate(characters):
-            char_x, char_y, char_w, char_h = char_bbox
-            char_center = char_x + char_w / 2
-            is_below = ott_y > char_y + char_h * 0.5
-            is_diagonal_right = ott_x >= char_x - ott_w * 0.5 and ott_x + ott_w <= char_x + char_w * 1.5
-            iou = compute_iou(ott_bbox, char_bbox)
-            distance = abs(ott_center - char_center) + abs(ott_y - (char_y + char_h)) * 0.5
-            if (is_below or is_diagonal_right) and (iou > 0.1 or distance < min_distance):
-                if iou > max_iou or (iou == max_iou and distance < min_distance):
-                    max_iou = iou
-                    min_distance = distance
-                    associated_char_idx = i
-        if associated_char_idx >= 0:
-            characters[associated_char_idx][2].append((ott_roi, ott_bbox))
-    return characters
-
 def prepare_segmented_image(roi, padding=10):
     if len(roi.shape) == 3:
         roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     masked_roi = np.where(mask == 255, roi, 255)
-    padded_img = cv2.copyMakeBorder(masked_roi, padding, padding, padding, padding,
+    padded_img = cv2.copyMakeBorder(masked_roi, padding, padding, padding, padding, 
                                     cv2.BORDER_CONSTANT, value=255)
     return padded_img
 
@@ -456,9 +281,9 @@ def save_predicted_text(segmentation_result, output_dir, session_id):
         with open(output_file, 'w', encoding='utf-8') as f:
             for li in sorted(segmentation_result["lines"].keys(), key=int):
                 line_text = ""
-                for wi in sorted(segmentation_result["lines"][li]["words"].keys(), key=int):
+                for wi in sorted(segmentation_result["lines"][str(li)]["words"].keys(), key=int):
                     word_text = ""
-                    for char in segmentation_result["lines"][li]["words"][wi]["characters"]:
+                    for char in segmentation_result["lines"][str(li)]["words"][str(wi)]["characters"]:
                         combined_char = char.get("combined_char", "Unknown")
                         word_text += combined_char
                     line_text += word_text + " "
@@ -470,16 +295,51 @@ def save_predicted_text(segmentation_result, output_dir, session_id):
         traceback.print_exc()
         return None
 
-def process_image(image_path, main_model, ott_model, main_mean, main_std, ott_mean, ott_std, main_class_names, ott_class_names, output_dir, session_id):
+def process_image_with_predictions(image_path, main_model, ott_model, main_mean, main_std, ott_mean, ott_std, main_class_names, ott_class_names, output_dir, session_id):
     mappings = load_mappings(os.path.join('kannada_mappings.json'))
     if mappings is None:
         print("Warning: Proceeding without character mappings. Ottaksharas will be ignored.")
+    
+    # Call the segmentation pipeline
+    segmentation_result = process_image(image_path, os.path.join(output_dir, session_id))
+    if segmentation_result is None:
+        raise ValueError(f"Segmentation failed for image at {image_path}")
+    
+    # Convert integer keys to strings for compatibility
+    segmentation_result_str = {"lines": {}}
+    for li in segmentation_result["lines"]:
+        segmentation_result_str["lines"][str(li)] = {
+            "line_img": segmentation_result["lines"][li]["line_img"],
+            "bbox": [int(x) for x in segmentation_result["lines"][li]["bbox"]],
+            "words": {}
+        }
+        for wi in segmentation_result["lines"][li]["words"]:
+            segmentation_result_str["lines"][str(li)]["words"][str(wi)] = {
+                "word_img": segmentation_result["lines"][li]["words"][wi]["word_img"],
+                "bbox": [int(x) for x in segmentation_result["lines"][li]["words"][wi]["bbox"]],
+                "characters": []
+            }
+            for char in segmentation_result["lines"][li]["words"][wi]["characters"]:
+                char_data = {
+                    "char_img": char["char_img"],
+                    "bbox": [int(x) for x in char["bbox"]],
+                    "type": char["type"],
+                    "ottaksharas": []
+                }
+                for ott in char.get("ottaksharas", []):
+                    char_data["ottaksharas"].append({
+                        "char_img": ott["char_img"],
+                        "bbox": [int(x) for x in ott["bbox"]],
+                        "type": ott["type"]
+                    })
+                segmentation_result_str["lines"][str(li)]["words"][str(wi)]["characters"].append(char_data)
+    
+    # Load original image for drawing bounding boxes
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Cannot load image at {image_path}")
-    image = deskew_image(image)
-    segmentation_result = {"lines": {}}
     
+    # Create directories for saving bounding box images
     lines_dir = os.path.join(output_dir, session_id, "lines")
     words_dir = os.path.join(output_dir, session_id, "words")
     chars_dir = os.path.join(output_dir, session_id, "characters")
@@ -487,90 +347,70 @@ def process_image(image_path, main_model, ott_model, main_mean, main_std, ott_me
     os.makedirs(words_dir, exist_ok=True)
     os.makedirs(chars_dir, exist_ok=True)
     
-    sentences = segment_sentence(image)
-    for li, (line_img, line_bbox) in enumerate(sentences):
-        enhanced_line = prepare_segmented_image(line_img)
-        line_path = os.path.join(lines_dir, f"line_{int(li):03d}.png")
-        cv2.imwrite(line_path, enhanced_line)
-        
+    # Process predictions and save bounding box images
+    for li in segmentation_result_str["lines"]:
+        # Save line bounding box image
+        line_bbox = segmentation_result_str["lines"][li]["bbox"]
         line_bbox_img = image.copy()
         x, y, w, h = line_bbox
         cv2.rectangle(line_bbox_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
         line_bbox_path = os.path.join(lines_dir, f"line_{int(li):03d}_bbox.png")
         cv2.imwrite(line_bbox_path, line_bbox_img)
+        segmentation_result_str["lines"][li]["bbox_url"] = f"/static/{session_id}/lines/line_{int(li):03d}_bbox.png"
         
-        segmentation_result["lines"][str(li)] = {
-            "line_img": enhanced_line,
-            "bbox": [int(x) for x in line_bbox],
-            "bbox_url": f"/static/{session_id}/lines/line_{int(li):03d}_bbox.png",
-            "words": {}
-        }
-        
-        words = segment_word(line_img)
-        for wi, (word_img, word_bbox) in enumerate(words):
-            enhanced_word = prepare_segmented_image(word_img)
-            word_path = os.path.join(words_dir, f"line_{int(li):03d}_word_{int(wi):03d}.png")
-            cv2.imwrite(word_path, enhanced_word)
-            
-            word_bbox_img = cv2.cvtColor(line_img, cv2.COLOR_GRAY2BGR).copy()
+        for wi in segmentation_result_str["lines"][li]["words"]:
+            # Save word bounding box image
+            word_bbox = segmentation_result_str["lines"][li]["words"][wi]["bbox"]
+            word_bbox_img = cv2.cvtColor(segmentation_result_str["lines"][li]["line_img"], cv2.COLOR_GRAY2BGR).copy()
             wx, wy, ww, wh = word_bbox
             cv2.rectangle(word_bbox_img, (wx, wy), (wx + ww, wy + wh), (0, 255, 0), 2)
             word_bbox_path = os.path.join(words_dir, f"line_{int(li):03d}_word_{int(wi):03d}_bbox.png")
             cv2.imwrite(word_bbox_path, word_bbox_img)
+            segmentation_result_str["lines"][li]["words"][wi]["bbox_url"] = f"/static/{session_id}/words/line_{int(li):03d}_word_{int(wi):03d}_bbox.png"
             
-            segmentation_result["lines"][str(li)]["words"][str(wi)] = {
-                "word_img": enhanced_word,
-                "bbox": [int(x) for x in word_bbox],
-                "bbox_url": f"/static/{session_id}/words/line_{int(li):03d}_word_{int(wi):03d}_bbox.png",
-                "characters": []
-            }
-            
-            characters = segment_character(word_img)
-            for ci, (char_roi, char_bbox, ottaksharas) in enumerate(characters):
-                enhanced_char = prepare_segmented_image(char_roi)
-                char_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main.png")
-                cv2.imwrite(char_path, enhanced_char)
-                
-                char_bbox_img = cv2.cvtColor(word_img, cv2.COLOR_GRAY2BGR).copy()
+            for ci, char in enumerate(segmentation_result_str["lines"][li]["words"][wi]["characters"]):
+                # Save character bounding box image
+                char_bbox = char["bbox"]
+                char_bbox_img = cv2.cvtColor(segmentation_result_str["lines"][li]["words"][wi]["word_img"], cv2.COLOR_GRAY2BGR).copy()
                 cx, cy, cw, ch = char_bbox
                 cv2.rectangle(char_bbox_img, (cx, cy), (cx + cw, cy + ch), (0, 255, 0), 2)
                 char_bbox_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png")
                 cv2.imwrite(char_bbox_path, char_bbox_img)
+                char["bbox_url"] = f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png"
                 
+                # Save enhanced character image
+                enhanced_char = prepare_segmented_image(char["char_img"])
+                char_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main.png")
+                cv2.imwrite(char_path, enhanced_char)
+                
+                # Predict main character
                 char_pred = predict_image(main_model, enhanced_char, main_mean, main_std, main_class_names, MainCFG.DEVICE, is_segmented=True)
-                char_data = {
-                    "char_img": enhanced_char,
-                    "bbox": [int(x) for x in char_bbox],
-                    "bbox_url": f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png",
-                    "type": "main",
-                    "prediction": char_pred,
-                    "ottaksharas": [],
-                    "combined_char": char_pred["class_name"] if char_pred else "Unknown"
-                }
+                char["prediction"] = char_pred
                 
+                # Update combined_char
                 ottakshara_chars = []
-                for oi, (ott_roi, ott_bbox) in enumerate(ottaksharas):
-                    enhanced_ott = prepare_segmented_image(ott_roi)
-                    ott_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}.png")
-                    cv2.imwrite(ott_path, enhanced_ott)
-                    
-                    ott_bbox_img = cv2.cvtColor(word_img, cv2.COLOR_GRAY2BGR).copy()
+                for oi, ott in enumerate(char["ottaksharas"]):
+                    # Save ottakshara bounding box image
+                    ott_bbox = ott["bbox"]
+                    ott_bbox_img = cv2.cvtColor(segmentation_result_str["lines"][li]["words"][wi]["word_img"], cv2.COLOR_GRAY2BGR).copy()
                     ox, oy, ow, oh = ott_bbox
                     cv2.rectangle(ott_bbox_img, (ox, oy), (ox + ow, oy + oh), (0, 255, 0), 2)
                     ott_bbox_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png")
                     cv2.imwrite(ott_bbox_path, ott_bbox_img)
+                    ott["bbox_url"] = f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png"
                     
+                    # Save enhanced ottakshara image
+                    enhanced_ott = prepare_segmented_image(ott["char_img"])
+                    ott_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}.png")
+                    cv2.imwrite(ott_path, enhanced_ott)
+                    
+                    # Predict ottakshara
                     ott_pred = predict_image(ott_model, enhanced_ott, ott_mean, ott_std, ott_class_names, OttaksharaCFG.DEVICE, is_segmented=True)
-                    char_data["ottaksharas"].append({
-                        "char_img": enhanced_ott,
-                        "bbox": [int(x) for x in ott_bbox],
-                        "bbox_url": f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png",
-                        "type": "ottakshara",
-                        "prediction": ott_pred
-                    })
+                    ott["prediction"] = ott_pred
                     if ott_pred:
                         ottakshara_chars.append(ott_pred)
                 
+                # Combine characters if necessary
                 if char_pred and ottakshara_chars and mappings:
                     combined = combine_characters(
                         char_pred["index"],
@@ -579,14 +419,12 @@ def process_image(image_path, main_model, ott_model, main_mean, main_std, ott_me
                         ott_class_names,
                         mappings
                     )
-                    char_data["combined_char"] = combined
+                    char["combined_char"] = combined
                 elif char_pred:
-                    char_data["combined_char"] = char_pred["class_name"]
-                
-                segmentation_result["lines"][str(li)]["words"][str(wi)]["characters"].append(char_data)
+                    char["combined_char"] = char_pred["class_name"]
     
-    predicted_text_url = save_predicted_text(segmentation_result, output_dir, session_id)
-    return segmentation_result, predicted_text_url
+    predicted_text_url = save_predicted_text(segmentation_result_str, output_dir, session_id)
+    return segmentation_result_str, predicted_text_url
 
 def compute_metrics(segmentation_result, session_id):
     total_lines = len(segmentation_result["lines"])
@@ -644,63 +482,13 @@ def compute_metrics(segmentation_result, session_id):
         "avg_confidence": avg_confidence
     }, predictions
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-@app.route('/upload', methods=['POST'])
-def upload_image():
-    try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No file part"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"error": "No selected file"}), 400
-        if file and allowed_file(file.filename):
-            session_id = str(uuid.uuid4())
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
-            file.save(file_path)
-            
-            segmentation_result, predicted_text_url = process_image(file_path, main_model, ott_model, main_mean, main_std, ott_mean, ott_std, main_class_names, ott_class_names, app.config['STATIC_FOLDER'], session_id)
-            metrics, predictions = compute_metrics(segmentation_result, session_id)
-            
-            os.remove(file_path)
-            
-            for li in segmentation_result["lines"]:
-                segmentation_result["lines"][li]["line_img"] = None
-                for wi in segmentation_result["lines"][li]["words"]:
-                    segmentation_result["lines"][li]["words"][wi]["word_img"] = None
-                    for char in segmentation_result["lines"][li]["words"][wi]["characters"]:
-                        char["char_img"] = None
-                        for ott in char["ottaksharas"]:
-                            ott["char_img"] = None
-            
-            return jsonify({
-                "segmentation": segmentation_result,
-                "predictions": predictions,
-                "metrics": metrics,
-                "session_id": session_id,
-                "predicted_text_url": predicted_text_url
-            })
-        else:
-            return jsonify({"error": "File type not allowed"}), 400
-    except Exception as e:
-        print(f"Error processing request: {e}")
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/static/<session_id>/<path:path>')
-def serve_static(session_id, path):
-    return send_from_directory(os.path.join(app.config['STATIC_FOLDER'], session_id), path)
-
-if __name__ == "__main__":
-    seed_everything(MainCFG.SEED)
-    try:
-        main_class_names = load_class_names(MainCFG.LABEL_CSV_PATH, MainCFG.NUM_CLASSES)
-        ott_class_names = load_class_names(OttaksharaCFG.LABEL_CSV_PATH, OttaksharaCFG.NUM_CLASSES)
-        main_model, main_mean, main_std = load_model_and_stats(MainCFG.MODEL_CHECKPOINT_FILE, MainCFG)
-        ott_model, ott_mean, ott_std = load_model_and_stats(OttaksharaCFG.MODEL_CHECKPOINT_FILE, OttaksharaCFG)
-    except Exception as e:
-        print(f"Error loading resources: {e}")
-        exit(1)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+# Initialize global variables
+seed_everything(MainCFG.SEED)
+try:
+    main_class_names = load_class_names(MainCFG.LABEL_CSV_PATH, MainCFG.NUM_CLASSES)
+    ott_class_names = load_class_names(OttaksharaCFG.LABEL_CSV_PATH, OttaksharaCFG.NUM_CLASSES)
+    main_model, main_mean, main_std = load_model_and_stats(MainCFG.MODEL_CHECKPOINT_FILE, MainCFG)
+    ott_model, ott_mean, ott_std = load_model_and_stats(OttaksharaCFG.MODEL_CHECKPOINT_FILE, OttaksharaCFG)
+except Exception as e:
+    print(f"Error loading resources: {e}")
+    exit(1)

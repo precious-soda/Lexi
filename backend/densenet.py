@@ -9,14 +9,9 @@ import torchvision.transforms.v2 as T
 import torchvision.models as models
 import pandas as pd
 import random
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import traceback
-from segmentation.v3 import process_image, Binarization
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
+from segmentation.v2 import process_image, Binarization  
 
 # Configuration classes
 class MainCFG:
@@ -41,17 +36,9 @@ class OttaksharaCFG:
     MODEL_CHECKPOINT_FILE = os.path.join(MODEL_CHECKPOINT_DIR, 'kannada_densenet121_attention_best.pth')
     LABEL_CSV_PATH = os.path.join('label-ottaksharas.csv')
 
-UPLOAD_FOLDER = './uploads'
-STATIC_FOLDER = './static'
 FONT_PATH = './model/NotoSansKannada-VariableFont_wdthwght.ttf'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['STATIC_FOLDER'] = STATIC_FOLDER
 TARGET_SIZE = MainCFG.IMAGE_SIZE
 CROP_PADDING = 10
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(STATIC_FOLDER, exist_ok=True)
 
 # Seed for reproducibility
 def seed_everything(seed):
@@ -63,7 +50,7 @@ def seed_everything(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-# Attention modules for DenseNet
+# Attention modules
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
@@ -371,33 +358,39 @@ def predict_image(model, roi, train_mean, train_std, class_names, device, is_seg
         "confidence": pred_confidence
     }
 
-def save_predicted_text(segmentation_result, output_dir, session_id):
+def save_predicted_text(segmentation_result, output_dir, session_id, page_index=0):
     try:
-        output_file = os.path.join(output_dir, session_id, "predicted_text.txt")
+        output_file = os.path.join(output_dir, session_id, f"predicted_text_page_{page_index}.txt")
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        predicted_text = ""
+        for li in sorted(segmentation_result["lines"].keys(), key=int):
+            line_text = ""
+            for wi in sorted(segmentation_result["lines"][str(li)]["words"].keys(), key=int):
+                word_text = ""
+                for char in segmentation_result["lines"][str(li)]["words"][str(wi)]["characters"]:
+                    combined_char = char.get("combined_char", "Unknown")
+                    word_text += combined_char
+                line_text += word_text + " "
+            predicted_text += line_text.strip() + "\n"
+            print(f"Line {li} text: {line_text.strip()}")
+        if predicted_text.startswith('/static/'):
+            print(f"Error: Attempted to save URL as text: {predicted_text}")
+            raise ValueError("Predicted text is a URL, not transcribed text")
         with open(output_file, 'w', encoding='utf-8') as f:
-            for li in sorted(segmentation_result["lines"].keys(), key=int):
-                line_text = ""
-                for wi in sorted(segmentation_result["lines"][str(li)]["words"].keys(), key=int):
-                    word_text = ""
-                    for char in segmentation_result["lines"][str(li)]["words"][str(wi)]["characters"]:
-                        combined_char = char.get("combined_char", "Unknown")
-                        word_text += combined_char
-                    line_text += word_text + " "
-                f.write(line_text.strip() + "\n")
+            f.write(predicted_text)
         print(f"Saved predicted text to {output_file}")
-        return f"/static/{session_id}/predicted_text.txt"
+        return f"/static/{session_id}/predicted_text_page_{page_index}.txt"
     except Exception as e:
         print(f"Error saving predicted text: {e}")
         traceback.print_exc()
         return None
 
-def process_image_with_predictions(image_path, main_model, ott_model, main_mean, main_std, ott_mean, ott_std, main_class_names, ott_class_names, output_dir, session_id):
+def process_image_with_predictions(image_path, main_model, ott_model, main_mean, main_std, ott_mean, ott_std, main_class_names, ott_class_names, output_dir, session_id, page_index=0):
     mappings = load_mappings(os.path.join('kannada_mappings.json'))
     if mappings is None:
         print("Warning: Proceeding without character mappings. Ottaksharas will be ignored.")
     
-    # Call the segmentation pipeline from segmentation.main
+    # Call the segmentation pipeline
     segmentation_result = process_image(image_path, os.path.join(output_dir, session_id))
     if segmentation_result is None:
         raise ValueError(f"Segmentation failed for image at {image_path}")
@@ -451,9 +444,9 @@ def process_image_with_predictions(image_path, main_model, ott_model, main_mean,
         line_bbox_img = image.copy()
         x, y, w, h = line_bbox
         cv2.rectangle(line_bbox_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        line_bbox_path = os.path.join(lines_dir, f"line_{int(li):03d}_bbox.png")
+        line_bbox_path = os.path.join(lines_dir, f"page_{page_index}_line_{int(li):03d}_bbox.png")
         cv2.imwrite(line_bbox_path, line_bbox_img)
-        segmentation_result_str["lines"][li]["bbox_url"] = f"/static/{session_id}/lines/line_{int(li):03d}_bbox.png"
+        segmentation_result_str["lines"][li]["bbox_url"] = f"/static/{session_id}/lines/page_{page_index}_line_{int(li):03d}_bbox.png"
         
         for wi in segmentation_result_str["lines"][li]["words"]:
             # Save word bounding box image
@@ -461,9 +454,9 @@ def process_image_with_predictions(image_path, main_model, ott_model, main_mean,
             word_bbox_img = cv2.cvtColor(segmentation_result_str["lines"][li]["line_img"], cv2.COLOR_GRAY2BGR).copy()
             wx, wy, ww, wh = word_bbox
             cv2.rectangle(word_bbox_img, (wx, wy), (wx + ww, wy + wh), (0, 255, 0), 2)
-            word_bbox_path = os.path.join(words_dir, f"line_{int(li):03d}_word_{int(wi):03d}_bbox.png")
+            word_bbox_path = os.path.join(words_dir, f"page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_bbox.png")
             cv2.imwrite(word_bbox_path, word_bbox_img)
-            segmentation_result_str["lines"][li]["words"][wi]["bbox_url"] = f"/static/{session_id}/words/line_{int(li):03d}_word_{int(wi):03d}_bbox.png"
+            segmentation_result_str["lines"][li]["words"][wi]["bbox_url"] = f"/static/{session_id}/words/page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_bbox.png"
             
             for ci, char in enumerate(segmentation_result_str["lines"][li]["words"][wi]["characters"]):
                 # Save character bounding box image
@@ -471,13 +464,13 @@ def process_image_with_predictions(image_path, main_model, ott_model, main_mean,
                 char_bbox_img = cv2.cvtColor(segmentation_result_str["lines"][li]["words"][wi]["word_img"], cv2.COLOR_GRAY2BGR).copy()
                 cx, cy, cw, ch = char_bbox
                 cv2.rectangle(char_bbox_img, (cx, cy), (cx + cw, cy + ch), (0, 255, 0), 2)
-                char_bbox_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png")
+                char_bbox_path = os.path.join(chars_dir, f"page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png")
                 cv2.imwrite(char_bbox_path, char_bbox_img)
-                char["bbox_url"] = f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png"
+                char["bbox_url"] = f"/static/{session_id}/characters/page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main_bbox.png"
                 
                 # Save enhanced character image
                 enhanced_char = prepare_segmented_image(char["char_img"])
-                char_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main.png")
+                char_path = os.path.join(chars_dir, f"page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main.png")
                 cv2.imwrite(char_path, enhanced_char)
                 
                 # Predict main character
@@ -492,13 +485,13 @@ def process_image_with_predictions(image_path, main_model, ott_model, main_mean,
                     ott_bbox_img = cv2.cvtColor(segmentation_result_str["lines"][li]["words"][wi]["word_img"], cv2.COLOR_GRAY2BGR).copy()
                     ox, oy, ow, oh = ott_bbox
                     cv2.rectangle(ott_bbox_img, (ox, oy), (ox + ow, oy + oh), (0, 255, 0), 2)
-                    ott_bbox_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png")
+                    ott_bbox_path = os.path.join(chars_dir, f"page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png")
                     cv2.imwrite(ott_bbox_path, ott_bbox_img)
-                    ott["bbox_url"] = f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png"
+                    ott["bbox_url"] = f"/static/{session_id}/characters/page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}_bbox.png"
                     
                     # Save enhanced ottakshara image
                     enhanced_ott = prepare_segmented_image(ott["char_img"])
-                    ott_path = os.path.join(chars_dir, f"line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}.png")
+                    ott_path = os.path.join(chars_dir, f"page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}.png")
                     cv2.imwrite(ott_path, enhanced_ott)
                     
                     # Predict ottakshara
@@ -520,10 +513,23 @@ def process_image_with_predictions(image_path, main_model, ott_model, main_mean,
                 elif char_pred:
                     char["combined_char"] = char_pred["class_name"]
     
-    predicted_text_url = save_predicted_text(segmentation_result_str, output_dir, session_id)
-    return segmentation_result_str, predicted_text_url
+    # Generate predicted text
+    predicted_text = ""
+    for li in sorted(segmentation_result_str["lines"].keys(), key=int):
+        line_text = ""
+        for wi in sorted(segmentation_result_str["lines"][str(li)]["words"].keys(), key=int):
+            word_text = ""
+            for char in segmentation_result_str["lines"][str(li)]["words"][str(wi)]["characters"]:
+                combined_char = char.get("combined_char", "Unknown")
+                word_text += combined_char
+            line_text += word_text + " "
+        predicted_text += line_text.strip() + "\n"
+    print(f"Generated predicted text for page {page_index}:\n{predicted_text}")
+    
+    predicted_text_url = save_predicted_text(segmentation_result_str, output_dir, session_id, page_index)
+    return segmentation_result_str, predicted_text.strip()
 
-def compute_metrics(segmentation_result, session_id):
+def compute_metrics(segmentation_result, session_id, page_index=0):
     total_lines = len(segmentation_result["lines"])
     total_words = 0
     total_chars = 0
@@ -547,7 +553,7 @@ def compute_metrics(segmentation_result, session_id):
                         "type": "main",
                         "label": pred["class_name"],
                         "confidence": float(pred["confidence"]),
-                        "char_url": f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main.png",
+                        "char_url": f"/static/{session_id}/characters/page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_main.png",
                         "combined_char": combined_char
                     })
                 for oi, ott in enumerate(char["ottaksharas"]):
@@ -564,7 +570,7 @@ def compute_metrics(segmentation_result, session_id):
                             "type": "ottakshara",
                             "label": ott_pred["class_name"],
                             "confidence": float(ott_pred["confidence"]),
-                            "char_url": f"/static/{session_id}/characters/line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}.png",
+                            "char_url": f"/static/{session_id}/characters/page_{page_index}_line_{int(li):03d}_word_{int(wi):03d}_char_{ci:02d}_ottakshara_{oi:02d}.png",
                             "combined_char": combined_char
                         })
     avg_area = float(np.mean(areas)) if areas else 0.0
@@ -579,69 +585,13 @@ def compute_metrics(segmentation_result, session_id):
         "avg_confidence": avg_confidence
     }, predictions
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-@app.route('/upload', methods=['POST'])
-def upload_image():
-    try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No file part"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"error": "No selected file"}), 400
-        if file and allowed_file(file.filename):
-            session_id = str(uuid.uuid4())
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
-            file.save(file_path)
-            
-            # Process image with predictions
-            segmentation_result, predicted_text_url = process_image_with_predictions(
-                file_path, main_model, ott_model, main_mean, main_std, ott_mean, ott_std,
-                main_class_names, ott_class_names, app.config['STATIC_FOLDER'], session_id
-            )
-            metrics, predictions = compute_metrics(segmentation_result, session_id)
-            
-            # Clean up uploaded file
-            os.remove(file_path)
-            
-            # Remove non-serializable image data from response
-            for li in segmentation_result["lines"]:
-                segmentation_result["lines"][li]["line_img"] = None
-                for wi in segmentation_result["lines"][li]["words"]:
-                    segmentation_result["lines"][li]["words"][wi]["word_img"] = None
-                    for char in segmentation_result["lines"][li]["words"][wi]["characters"]:
-                        char["char_img"] = None
-                        for ott in char["ottaksharas"]:
-                            ott["char_img"] = None
-            
-            return jsonify({
-                "segmentation": segmentation_result,
-                "predictions": predictions,
-                "metrics": metrics,
-                "session_id": session_id,
-                "predicted_text_url": predicted_text_url
-            })
-        else:
-            return jsonify({"error": "File type not allowed"}), 400
-    except Exception as e:
-        print(f"Error processing request: {e}")
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/static/<session_id>/<path:path>')
-def serve_static(session_id, path):
-    return send_from_directory(os.path.join(app.config['STATIC_FOLDER'], session_id), path)
-
-if __name__ == "__main__":
-    seed_everything(MainCFG.SEED)
-    try:
-        main_class_names = load_class_names(MainCFG.LABEL_CSV_PATH, MainCFG.NUM_CLASSES)
-        ott_class_names = load_class_names(OttaksharaCFG.LABEL_CSV_PATH, OttaksharaCFG.NUM_CLASSES)
-        main_model, main_mean, main_std = load_model_and_stats(MainCFG.MODEL_CHECKPOINT_FILE, MainCFG)
-        ott_model, ott_mean, ott_std = load_model_and_stats(OttaksharaCFG.MODEL_CHECKPOINT_FILE, OttaksharaCFG)
-    except Exception as e:
-        print(f"Error loading resources: {e}")
-        exit(1)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+# Initialize global variables
+seed_everything(MainCFG.SEED)
+try:
+    main_class_names = load_class_names(MainCFG.LABEL_CSV_PATH, MainCFG.NUM_CLASSES)
+    ott_class_names = load_class_names(OttaksharaCFG.LABEL_CSV_PATH, OttaksharaCFG.NUM_CLASSES)
+    main_model, main_mean, main_std = load_model_and_stats(MainCFG.MODEL_CHECKPOINT_FILE, MainCFG)
+    ott_model, ott_mean, ott_std = load_model_and_stats(OttaksharaCFG.MODEL_CHECKPOINT_FILE, OttaksharaCFG)
+except Exception as e:
+    print(f"Error loading resources: {e}")
+    exit(1)
