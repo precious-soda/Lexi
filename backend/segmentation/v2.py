@@ -16,6 +16,7 @@
 
     # Contact: Sahil Kumar Jamwal
     # Email: sahilkumarjamwal464@gmail.com
+    # GitHub: https://github.com/precious-soda
 
 import os
 import cv2
