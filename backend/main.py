@@ -1,3 +1,22 @@
+    # Lexi - An OCR for Kannada Handwritten Text
+    # Copyright (C) 2025  Sahil Kumar Jamwal
+
+    # This program is free software: you can redistribute it and/or modify
+    # it under the terms of the GNU General Public License as published by
+    # the Free Software Foundation, either version 3 of the License, or
+    # (at your option) any later version.
+
+    # This program is distributed in the hope that it will be useful,
+    # but WITHOUT ANY WARRANTY; without even the implied warranty of
+    # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    # GNU General Public License for more details.
+
+    # You should have received a copy of the GNU General Public License
+    # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+    # Contact: Sahil Kumar Jamwal
+    # Email: sahilkumarjamwal464@gmail.com
+
 import os
 import uuid
 import cv2
@@ -94,6 +113,11 @@ def generate_html_content(text_files, session_id, metrics=None):
     @page {{
         margin: 2cm;
         size: A4;
+        @bottom-center {{
+            content: "Page " counter(page);
+            font-size: 10px;
+            color: #888;
+        }}
     }}
     
     body {{
@@ -107,7 +131,7 @@ def generate_html_content(text_files, session_id, metrics=None):
     
     .page {{
         page-break-after: always;
-        margin-bottom: 2cm;
+        min-height: calc(297mm - 4cm); /* A4 height minus margins */
     }}
     
     .page:last-child {{
@@ -128,15 +152,8 @@ def generate_html_content(text_files, session_id, metrics=None):
         text-align: justify;
     }}
     
-    .page-number {{
-        text-align: center;
-        font-size: 10px;
-        color: #888;
-        margin-top: 1cm;
-    }}
-    
     .metrics-section {{
-        margin-top: 2cm;
+        margin-top: 0cm;
         padding: 1cm;
         display: flex;
         flex-direction: row;
@@ -230,7 +247,6 @@ def generate_html_content(text_files, session_id, metrics=None):
         html_content += f"""
         <div class="page">
             <div class="text-content">{escaped_text}</div>
-            <div class="page-number">Page {i + 1}</div>
         </div>
         """
     
@@ -240,17 +256,16 @@ def generate_html_content(text_files, session_id, metrics=None):
         <div class="page">
             <div class="metrics-section">
                 <div class="metric-box cer">
-                    <h2>Character Error Rate (CER)</h2>
+                    <h2>Character Error Rate</h2>
                     <div class="percentage">{metrics.get('CER', {}).get('percentage', 'N/A')}%</div>
                     <p>Edit distance: {metrics.get('CER', {}).get('editDistance', 'N/A')}/{metrics.get('CER', {}).get('totalCharacters', 'N/A')}</p>
                 </div>
                 <div class="metric-box wer">
-                    <h2>Word Error Rate (WER)</h2>
+                    <h2>Word Error Rate</h2>
                     <div class="percentage">{metrics.get('WER', {}).get('percentage', 'N/A')}%</div>
                     <p>Edit distance: {metrics.get('WER', {}).get('editDistance', 'N/A')}/{metrics.get('WER', {}).get('totalWords', 'N/A')}</p>
                 </div>
             </div>
-            <div class="page-number">Metrics</div>
         </div>
         """
     
@@ -549,7 +564,7 @@ def generate_transcribed_pdf(session_id):
             css = CSS(string="""
                 @page {
                     @top-center {
-                        content: "Kannada OCR Transcription";
+                        content: "OCR Transcription";
                         font-size: 10px;
                         color: #666;
                     }
